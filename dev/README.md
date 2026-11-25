@@ -28,6 +28,9 @@ Verified working on this configuration:
 
 jax and torch were confirmed to coexist on the card in one process.
 
+`dev/PORT-NOTES.md` records the state of the array-API port: what has been verified, the
+two traps worth knowing about before measuring anything, and what is left to do.
+
 `dev/parity/` holds the differential harness used to check the array-API port; read its
 README before trusting any numerical comparison, because XLA autotuning has to be turned
 off for one.
