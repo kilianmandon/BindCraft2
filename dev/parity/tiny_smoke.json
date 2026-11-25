@@ -1,0 +1,18 @@
+{
+  "modality": "binder",
+  "target": "hPDL1",
+  "campaign_name": "tiny_smoke",
+  "binder_lengths": [
+    55,
+    55
+  ],
+  "max_trajectories": 1,
+  "number_of_final_designs": 1,
+  "trajectory_only": true,
+  "screen_steps": 4,
+  "refine_steps": 2,
+  "anneal_steps": 2,
+  "harden_steps": 1,
+  "mutate_steps": 1,
+  "project_folder": "./smoke_run"
+}

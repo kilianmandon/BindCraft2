@@ -1,11 +1,13 @@
 from typing import Callable, Protocol, runtime_checkable
+import array_api_compat
+import array_api_extra as xpx
 import jax
 import jax.numpy as jnp
 import optax
 from jax import Array
 from bindcraft.loss import pairwise_atom_distances, pseudo_beta_coordinates
 from bindcraft.prediction import residue_chain_ids, update_shared_sequences, concatenate_chain_arrays, collect_shared_chains, split_residue_arrays_by_chain
-from bindcraft.protein import StructurePrediction, StructurePredictions, Protein, ResidueFlags, ProteinStates, has_residue_flag, is_binder_chain, real_residue_mask
+from bindcraft.protein import A, StructurePrediction, StructurePredictions, Protein, ResidueFlags, ProteinStates, has_residue_flag, is_binder_chain, real_residue_mask, softmax, stop_gradient
 
 _sum_state_gradients: Callable[[Array], Array] = lambda state_gradients: jnp.sum(state_gradients, axis=0)
 
@@ -32,22 +34,24 @@ def combine_sequence_gradients(accumulated_gradients: dict[str, list[Array]], co
 
 OMITTED_AMINO_ACID_LOGIT = -10000.0
 
-def omitted_amino_acid_mask(sequence: Array) -> Array:
+def omitted_amino_acid_mask(sequence: A) -> A:
     return sequence <= OMITTED_AMINO_ACID_LOGIT / 2
 
-def straight_through_one_hot(probabilities: Array) -> Array:
-    one_hot_sequence = jax.nn.one_hot(jnp.argmax(probabilities, axis=-1), probabilities.shape[-1])
-    return jax.lax.stop_gradient(one_hot_sequence - probabilities) + probabilities
+def straight_through_one_hot(probabilities: A) -> A:
+    xp = array_api_compat.array_namespace(probabilities)
+    one_hot_sequence = xpx.one_hot(xp.argmax(probabilities, axis=-1), probabilities.shape[-1])
+    return stop_gradient(one_hot_sequence - probabilities) + probabilities
 
-def sequence_features_from_logits(logits: Array, softmax_weight: Array, one_hot_weight: Array, temperature: Array, logit_scale: Array, amino_acid_bias: Array | None=None) -> Array:
+def sequence_features_from_logits(logits: A, softmax_weight: A, one_hot_weight: A, temperature: A, logit_scale: A, amino_acid_bias: A | None=None) -> A:
     #a composition bias belongs to the distribution the stage samples, not to the features AlphaFold reads: below
     #softmax_weight the linear path hands its logits to target_feat verbatim, where a one-hot is expected and an
     #offset of a few tenths is hundreds of times the 0.01 the logits start at, so the bias rides the softmax alone.
     #it is added after the scaling rather than before it, so one propensity is one log-odds shift at every stage:
     #inside, logit_scale 2.0 would square it and the anneal temperature would raise it to the hundredth power.
+    xp = array_api_compat.array_namespace(logits)
     scaled_logits = logits * logit_scale / temperature
-    sequence_probabilities = jax.nn.softmax(scaled_logits if amino_acid_bias is None else scaled_logits + amino_acid_bias)
-    blended_logits = jnp.where(omitted_amino_acid_mask(logits), 0.0, logits)
+    sequence_probabilities = softmax(scaled_logits if amino_acid_bias is None else scaled_logits + amino_acid_bias)
+    blended_logits = xp.where(omitted_amino_acid_mask(logits), 0.0, logits)
     sequence_features = softmax_weight * sequence_probabilities + (1 - softmax_weight) * blended_logits
     return one_hot_weight * straight_through_one_hot(sequence_probabilities) + (1 - one_hot_weight) * sequence_features
 

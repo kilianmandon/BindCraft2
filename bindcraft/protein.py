@@ -3,6 +3,8 @@ import io
 import os
 import re
 import warnings
+import array_api_compat
+import array_api_extra as xpx
 import biotite.structure as _struc
 import biotite.structure.io.pdb as _pdb
 import biotite.structure.io.pdbx as _pdbx
@@ -10,11 +12,16 @@ import jax
 import jax.numpy as jnp
 import numpy as _np
 import optax
+from jax.scipy.linalg import block_diag as _jax_block_diag
 from dataclasses import dataclass, replace
 from enum import IntFlag
 from itertools import accumulate
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypeVar
 from jax import Array
+
+# This should represent either a jax.Array or torch.Tensor, but isn't typed more strongly
+# so that it can exist on a system where one of them isn't installed
+A = TypeVar('A')
 
 AMINO_ACIDS = 'ARNDCQEGHILKMFPSTWYV'
 AMINO_ACID_INDEX: dict[str, int] = {amino_acid: index for index, amino_acid in enumerate(AMINO_ACIDS)}
@@ -50,42 +57,121 @@ class ResidueFlags(IntFlag):
     CYCLIC = 1 << 6
     PADDING = 1 << 7
 
-def has_residue_flag(flags: Array, flag: ResidueFlags) -> Array:
+def has_residue_flag(flags: A, flag: ResidueFlags) -> A:
     return flags & flag != 0
 
-def real_residue_mask(flags: Array) -> Array:
+def real_residue_mask(flags: A) -> A:
     return ~has_residue_flag(flags, ResidueFlags.PADDING)
 
-def redesignable_residue_mask(flags: Array) -> Array:
+def redesignable_residue_mask(flags: A) -> A:
+    xp = array_api_compat.array_namespace(flags)
     designed = has_residue_flag(flags, ResidueFlags.DESIGN)
-    return real_residue_mask(flags) & jnp.where(designed.any(), designed, True)
+    return real_residue_mask(flags) & xp.where(designed.any(), designed, True)
 
-def real_residue_count(flags: Array) -> Array:
+def real_residue_count(flags: A) -> A:
     return real_residue_mask(flags).sum()
 
-def real_residue_weights(flags: Array) -> Array:
-    return real_residue_mask(flags).astype(jnp.float32)
+def real_residue_weights(flags: A) -> A:
+    xp = array_api_compat.array_namespace(flags)
+    return xp.astype(real_residue_mask(flags), xp.float32)
 
-def has_resolved_atom(atom_mask: Array, name: str) -> Array:
+def has_resolved_atom(atom_mask: A, name: str) -> A:
     return atom_mask[:, ATOM_INDEX[name]]
 
-def alignment_matrix_product(left: Array, right: Array) -> Array:
-    return jnp.matmul(left, right, precision=jax.lax.Precision.HIGHEST)
+# array_api_compat helpers for some functions that aren't provided by xp or xpx
 
-def kabsch(coordinates: Array, reference_coordinates: Array, alignment_weights: Array) -> tuple[Array, Array, Array]:
+def _is_torch(value: A) -> bool:
+    return array_api_compat.is_torch_array(value)
+
+# Helper for calls to xp.arange that only forward the device when torch is used
+# This is here because, if xp.arange is called on jax in an eager part with device specified,
+# the device is "committed", and this committed flag can trigger recompilation
+def arange_beside(reference: A, count: int, dtype=None) -> A:
+    xp = array_api_compat.array_namespace(reference)
+    if _is_torch(reference):
+        return xp.arange(count, dtype=dtype, device=array_api_compat.device(reference))
+    return xp.arange(count, dtype=dtype)
+
+def softmax(values: A, axis: int=-1) -> A:
+    if _is_torch(values):
+        import torch
+        return torch.softmax(values, dim=axis)
+    return jax.nn.softmax(values, axis=axis)
+
+def log_softmax(values: A, axis: int=-1) -> A:
+    if _is_torch(values):
+        import torch
+        return torch.log_softmax(values, dim=axis)
+    return jax.nn.log_softmax(values, axis=axis)
+
+def relu(values: A) -> A:
+    if _is_torch(values):
+        import torch
+        return torch.relu(values)
+    return jax.nn.relu(values)
+
+def sigmoid(values: A) -> A:
+    if _is_torch(values):
+        import torch
+        return torch.sigmoid(values)
+    return jax.nn.sigmoid(values)
+
+def elu(values: A, alpha: float=1.0) -> A:
+    if _is_torch(values):
+        import torch
+        return torch.nn.functional.elu(values, alpha=alpha)
+    return jax.nn.elu(values, alpha=alpha)
+
+def stop_gradient(values: A) -> A:
+    return values.detach() if _is_torch(values) else jax.lax.stop_gradient(values)
+
+def block_diagonal(*blocks: A) -> A:
+    if blocks and _is_torch(blocks[0]):
+        import torch
+        return torch.block_diag(*blocks)
+    return _jax_block_diag(*blocks)
+
+def flat_nonzero(values: A) -> A:
+    if _is_torch(values):
+        import torch
+        return torch.flatten(torch.nonzero(torch.flatten(values)))
+    return jnp.flatnonzero(values)
+
+def boxcar_smooth(values: A, window: int) -> A:
+    xp = array_api_compat.array_namespace(values)
+    weights = xp.full((window,), 1.0 / window, dtype=values.dtype, device=array_api_compat.device(values))
+    if not _is_torch(values):
+        return jnp.convolve(values, weights, mode='same')
+    import torch
+    # convolve(mode='same') keeps the middle of the full convolution, which for an even window sits
+    # one place left of centre; conv1d correlates instead of convolving, but a uniform window is its
+    # own mirror, so matching that offset is the whole of the difference.
+    padding_after = (window - 1) // 2
+    padding_before = window - 1 - padding_after
+    padded = torch.nn.functional.pad(values[None, None, :], (padding_before, padding_after))
+    return torch.nn.functional.conv1d(padded, weights[None, None, :])[0, 0]
+
+def alignment_matrix_product(left: A, right: A) -> A:
+    xp = array_api_compat.array_namespace(left)
+    # TODO: Upon refactor, this drops precision=jax.lax.precision.HIGHEST. This might need to come back
+    return xp.matmul(left, right)
+
+def kabsch(coordinates: A, reference_coordinates: A, alignment_weights: A) -> tuple[A, A, A]:
+    xp = array_api_compat.array_namespace(coordinates)
     alignment_weight_sum = alignment_weights.sum() + 1e-08
     coordinate_center = (coordinates * alignment_weights[:, None]).sum(0) / alignment_weight_sum
     reference_center = (reference_coordinates * alignment_weights[:, None]).sum(0) / alignment_weight_sum
-    alignment_covariance = jnp.where(alignment_weights.sum() > 0, alignment_matrix_product(((coordinates - coordinate_center) * alignment_weights[:, None]).T, reference_coordinates - reference_center), jnp.eye(3, dtype=coordinates.dtype))
-    left_vectors, _, right_vectors = jnp.linalg.svd(alignment_covariance)
-    rotation_determinant = jnp.sign(jnp.linalg.det(alignment_matrix_product(right_vectors.T, left_vectors.T)))
-    rotation = alignment_matrix_product(right_vectors.T * jnp.array([1.0, 1.0, rotation_determinant], dtype=coordinates.dtype), left_vectors.T)
+    alignment_covariance = xp.where(alignment_weights.sum() > 0, alignment_matrix_product(((coordinates - coordinate_center) * alignment_weights[:, None]).T, reference_coordinates - reference_center), xp.eye(3, dtype=coordinates.dtype))
+    left_vectors, _, right_vectors = xp.linalg.svd(alignment_covariance)
+    rotation_determinant = xp.sign(xp.linalg.det(alignment_matrix_product(right_vectors.T, left_vectors.T)))
+    reflection_correction = xp.concat([xp.ones(2, dtype=coordinates.dtype), xp.reshape(xp.astype(rotation_determinant, coordinates.dtype), (1,))])
+    rotation = alignment_matrix_product(right_vectors.T * reflection_correction, left_vectors.T)
     return rotation, coordinate_center, reference_center
 
 RELAX_VDW_RADIUS_BY_ELEMENT: dict[str, float] = {'C': 1.7, 'N': 1.55, 'O': 1.52, 'S': 1.8}
 RELAX_BACKBONE_ATOM_NAMES: tuple[str, ...] = ('N', 'CA', 'C', 'O', 'OXT')
-ATOM37_VDW_RADIUS: Array = jnp.array([RELAX_VDW_RADIUS_BY_ELEMENT.get(name[0], RELAX_VDW_RADIUS_BY_ELEMENT['C']) for name in ATOM_NAMES])
-ATOM37_IS_BACKBONE: Array = jnp.array([name in RELAX_BACKBONE_ATOM_NAMES for name in ATOM_NAMES])
+ATOM37_VDW_RADIUS: _np.ndarray = _np.array([RELAX_VDW_RADIUS_BY_ELEMENT.get(name[0], RELAX_VDW_RADIUS_BY_ELEMENT['C']) for name in ATOM_NAMES])
+ATOM37_IS_BACKBONE: _np.ndarray = _np.array([name in RELAX_BACKBONE_ATOM_NAMES for name in ATOM_NAMES])
 RELAX_ENERGY_TERMS: tuple[str, ...] = ('input_atoms', 'position_weights', 'bond_rows', 'bond_columns', 'bond_lengths', 'clashing_pairs', 'closest_approach', 'weight_bond', 'weight_clash')
 
 #a restrained minimum settles short of the separation it is pushed towards, so the tolerance has to leave a relieved contact clear of the 2.5 A a clash is counted at
@@ -163,12 +249,12 @@ def relax_protein_complex(protein_complex: dict[str, 'Protein'], parameters: dic
     return relaxed_complex
 
 @dataclass
-class Protein:
-    sequence: Array
-    atoms: Array
-    atom_mask: Array
-    flags: Array
-    residue_index: Array
+class Protein[A]:
+    sequence: A
+    atoms: A
+    atom_mask: A
+    flags: A
+    residue_index: A
 
     def __len__(self) -> int:
         return int(self.sequence.shape[0])
@@ -177,10 +263,11 @@ class Protein:
         return replace(self, **kwargs)
 
     def padded_to(self, length: int) -> 'Protein':
+        xp = array_api_compat.array_namespace(self.sequence)
         padding = length - len(self)
         if padding <= 0:
             return self
-        return self.replace(sequence=jnp.pad(self.sequence, ((0, padding), (0, 0))), atoms=jnp.pad(self.atoms, ((0, padding), (0, 0), (0, 0))), atom_mask=jnp.pad(self.atom_mask, ((0, padding), (0, 0))), flags=jnp.pad(self.flags, (0, padding), constant_values=int(ResidueFlags.PADDING)), residue_index=jnp.concatenate([self.residue_index, self.residue_index[-1] + 1 + jnp.arange(padding, dtype=self.residue_index.dtype)]))
+        return self.replace(sequence=xpx.pad(self.sequence, ((0, padding), (0, 0))), atoms=xpx.pad(self.atoms, ((0, padding), (0, 0), (0, 0))), atom_mask=xpx.pad(self.atom_mask, ((0, padding), (0, 0))), flags=xpx.pad(self.flags, (0, padding), constant_values=int(ResidueFlags.PADDING)), residue_index=xp.concat([self.residue_index, self.residue_index[-1] + 1 + arange_beside(self.residue_index, padding, dtype=self.residue_index.dtype)]))
 
     def trimmed_to(self, length: int) -> 'Protein':
         return self if length >= len(self) else self.replace(sequence=self.sequence[:length], atoms=self.atoms[:length], atom_mask=self.atom_mask[:length], flags=self.flags[:length], residue_index=self.residue_index[:length])
@@ -280,11 +367,11 @@ class Protein:
         return Protein(sequence=jnp.asarray(edited_sequence, dtype=jnp.float16), atoms=jnp.asarray(edited_atom_positions, dtype=jnp.float16), atom_mask=jnp.asarray(edited_atom_mask, dtype=bool), flags=jnp.asarray(edited_residue_flags, dtype=jnp.uint8), residue_index=jnp.asarray(edited_residue_indices, dtype=jnp.int32))
 
 @dataclass
-class StructurePrediction:
-    protein_complex: dict[str, Protein]
-    metrics: dict[str, Array | float | int]
-ProteinStates = dict[str, dict[str, Protein]]
-StructurePredictions = dict[str, StructurePrediction]
+class StructurePrediction[A]:
+    protein_complex: dict[str, Protein[A]]
+    metrics: dict[str, A | float | int]
+ProteinStates = dict[str, dict[str, Protein[A]]]
+StructurePredictions = dict[str, StructurePrediction[A]]
 
 STRUCTURE_PATH_SUFFIXES = ('.pdb', '.cif', '.mmcif', '.ent', '.fasta', '.fa', '.faa')
 
