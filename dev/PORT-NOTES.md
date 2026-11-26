@@ -53,34 +53,43 @@ stage gate at 0.0, so the whole schedule always runs:
 | the three helpers under torch CUDA | all three return `cuda:0` tensors, and `elastic_network_covariance` backpropagates |
 | the same three on the pre-fix tree | two raise "found at least two devices"; `chain_group_rows` silently returns a CPU index tensor |
 
-| campaign (one per tree, `--core benchmark`, gates at 0.0) | paired trajectories | result |
-|---|---|---|
-| hPDL1, 10-round schedule | 24 | 24/24 bit-identical on all 10 metrics; warm design time 5.94 s vs 6.01 s |
-| hPDL1, 103-round schedule | 4 | 4/4 bit-identical; 61.7 s vs 62.2 s |
-| hIL7RA, 10-round schedule | 24 | 24/24 bit-identical (incl. `coldspot_repel`); 13.14 s vs 13.05 s |
+| campaign (one per tree, `--core benchmark`, gates at 0.0) | paired trajectories | agreement | design s, new / head |
+|---|---|---|---|
+| hPDL1, 10 rounds | 24 | 24/24 bit-identical on all 10 metrics | 5.94 / 6.01 = 0.989 |
+| hPDL1, 103 rounds | 4 | 4/4 | 61.7 / 62.2 = 0.991 |
+| hIL7RA, 10 rounds | 24 | 24/24, `coldspot_repel` included | 13.14 / 13.05 = 1.007 |
+| hIL7RA, 103 rounds | 4 | 4/4 | 137.7 / 138.1 = 0.997 |
+| hIL2R, 10 rounds | 12 | 12/12, two-chain target | 49.95 / 49.94 = 1.000 |
+| hIL2R, 103 rounds | 2 | 2/2 | 521.7 / 522.1 = 0.999 |
+| mPDL1, 10 rounds | 12 | 12/12 | 6.34 / 6.34 = 1.000 |
 
-Only trajectory 1 compiled in either tree of either campaign, so the new `device=` calls
-add no recompile — they execute on tracers inside the graph, where commitment does not
-exist (trap 2). The three design-time ratios are 0.989, 0.991 and 1.007: ±1%, no sign.
+**62 paired trajectories across four targets and two schedules, every one bit-identical.**
+Only trajectory 1 compiled in either tree of any campaign, so the new `device=` calls add
+no recompile — they execute on tracers inside the graph, where commitment does not exist
+(trap 2). The seven design-time ratios run 0.989 to 1.007, with no sign to them.
 
 The distributions those campaigns measured, per trajectory, at the last recorded round:
 
-| | hPDL1, 10 rounds | hPDL1, 103 rounds | hIL7RA, 10 rounds |
+| | pLDDT | i_pTM | i_pTM range |
 |---|---|---|---|
-| pLDDT | 0.9396 ± 0.0062 | 0.9780 ± 0.0150 | 0.9368 ± 0.0061 |
-| i_pTM | 0.198 ± 0.026 | 0.633 ± 0.225 | 0.141 ± 0.026 |
-| pTM | 0.6571 ± 0.0087 | 0.797 ± 0.081 | 0.7108 ± 0.0089 |
-| compactness | 0.92 ± 0.68 | 1.02 ± 0.39 | 1.96 ± 1.39 |
+| hPDL1, 10 rounds (n=24) | 0.9396 ± 0.0062 | 0.198 ± 0.026 | 0.147–0.266 |
+| hPDL1, 103 rounds (n=4) | 0.9780 ± 0.0150 | 0.633 ± 0.225 | 0.342–0.865 |
+| hIL7RA, 10 rounds (n=24) | 0.9368 ± 0.0061 | 0.141 ± 0.026 | 0.074–0.179 |
+| hIL7RA, 103 rounds (n=4) | 0.9668 ± 0.0174 | 0.481 ± 0.249 | 0.234–0.811 |
+| hIL2R, 10 rounds (n=12) | 0.9297 ± 0.0055 | 0.189 ± 0.059 | 0.147–0.367 |
+| mPDL1, 10 rounds (n=12) | 0.9413 ± 0.0039 | 0.204 ± 0.035 | 0.157–0.295 |
 
 A 10-round schedule is not a design: i_pTM sits at 0.14–0.20 and its spread is narrow
-because nothing has converged. The 103-round schedule is where the trajectories separate —
-i_pTM 0.34 to 0.87 across four of them — so that is the schedule a quality claim has to be
-made on, and 4 trajectories is nowhere near enough to make one.
+because nothing has converged, so a change could pass there and still ruin real campaigns.
+The 103-round schedule is where trajectories separate — i_pTM 0.23 to 0.87 — which makes it
+the schedule a quality claim has to be made on, and also the expensive one: 4 trajectories
+there cost about as much as 24 short ones, and 4 is nowhere near enough to make the claim.
+That tension, not the arithmetic, is what makes a quality comparison hard here.
 
 Two things to take from the campaign rows. First, **a change that only adds `device=` is
 bit-identical, not merely in-distribution** — with `--xla_gpu_autotune_level=0` the HLO is
 unchanged, so every metric of every paired trajectory agrees to the last bit, on both
-schedules and on both targets. That is a stronger result than the 6-seed comparison of
+schedules and on all four targets. That is a stronger result than the 6-seed comparison of
 `0f3eee1`, and it is the result to expect from any edit that does not touch an expression.
 
 Second, the per-metric spread above is what a *real* change has to be measured against,
