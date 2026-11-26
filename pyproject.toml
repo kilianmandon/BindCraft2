@@ -15,6 +15,7 @@ dependencies = [
     "torch>=2.15.0",
     "array-api-compat>=1.16.0",
     "array-api-extra>=0.11.5",
+    "pandas>=3.1.1",
 ]
 
 [project.scripts]
@@ -46,3 +47,12 @@ include = ["bindcraft*"]
 # where a container bakes them.
 [tool.setuptools.package-data]
 bindcraft = ["weights/proteinmpnn/*/*.npz", "weights/README.md"]
+
+# bindcraft/openfold is a plain clone of aqlaboratory/openfold (see dev/README.md), and every file
+# inside it imports itself absolutely, as `from openfold...`. So the clone's root — not the repo
+# root — has to be on the path for it to import at all. At runtime that is one .pth file in the
+# venv; this is the same path for the type checker, which otherwise reports the openfold imports in
+# bindcraft/af2_pytorch.py as unknown symbols.
+[tool.pyright]
+extraPaths = ["bindcraft/openfold"]
+reportMissingModuleSource = "none"

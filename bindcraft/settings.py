@@ -612,6 +612,17 @@ def default_design_model_count(settings: dict, multimer_pool: tuple[str, ...]) -
     return len(multimer_pool)
 
 def select_design_and_validation_models(settings: dict, multimer_pool: tuple[str, ...], monomer_pool: tuple[str, ...]) -> PredictionModelSelection:
+    if settings['design_model'] in {'af2_multimer', 'of2_multimer'}:
+        return _select_design_and_validation_models(settings, multimer_pool, monomer_pool)
+    elif settings['design_model']=='protenix':
+        raise NotImplementedError("Protenix Model loading is not yet implemented.")
+        # multimer_pool = ['protenix_base_default_v1.0.0', 'protenix_base_20250630_v1.0.0', 'protenix_base_default_v0.5.0']
+        multimer_pool = ('protenix_base_default_v1.0.0',)
+        return _select_design_and_validation_models(settings, multimer_pool, MONOMER_POOL)
+    else:
+        raise RuntimeError(f'design_model={settings["design_model"]} is not provided.')
+
+def _select_design_and_validation_models(settings: dict, multimer_pool: tuple[str, ...], monomer_pool: tuple[str, ...]) -> PredictionModelSelection:
     campaign_seed = int(settings.get('campaign_seed') or 0)
     requested_validation_models = resolve_model_pool_selection(settings.get('validation_models'), validation_model_pool(settings, multimer_pool, monomer_pool))
     named_validation_models = named_prediction_models(requested_validation_models)

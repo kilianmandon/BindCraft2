@@ -1,0 +1,28 @@
+{
+    "modality": "binder",
+    "target": "hPDL1",
+    "design_model": "of2_multimer",
+    "campaign_name": "test_run",
+    "binder_lengths": [
+        55,
+        55
+    ],
+    "max_trajectories": 4,
+    "number_of_final_designs": 1,
+    "trajectory_only": true,
+
+    "screen_steps": 4,
+    "refine_steps": 2,
+    "anneal_steps": 2,
+    "harden_steps": 1,
+    "mutate_steps": 1,
+
+    "min_plddt_screen": 0.0,
+    "min_plddt_refine": 0.0,
+    "min_plddt_anneal": 0.0,
+    "min_plddt_harden": 0.0,
+    "min_plddt_mutate": 0.0,
+    "min_iptm_anneal": 0.0,
+    "min_iptm_harden": 0.0,
+    "min_iptm_mutate": 0.0
+}

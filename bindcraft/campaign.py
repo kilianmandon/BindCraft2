@@ -4,6 +4,7 @@ import time
 from dataclasses import dataclass
 import jax
 from bindcraft.af2 import AlphaFoldDesignModel, MONOMER_POOL, MULTIMER_POOL, campaign_length_bucket, padded_prediction_length
+from bindcraft.af2_pytorch import OpenFoldDesignModel
 from bindcraft.campaign_output import trajectory_output_path, CampaignProgress, DEFAULT_PROJECT_FOLDER, RANKING_METRIC, RANK_STAGE, REFOLD_STAGE, TRAJECTORY_STAGE, accepted_state_suffixes, append_accepted_design, append_campaign_metrics, archive_trajectory_folder, claimed_trajectory_directory, designed_span_stamp, discard_trajectory_structures, drawn_weight_stamp, model_score_stamp, rank_accepted_designs, reprediction_facts, structure_metadata, stage_folder, stage_table, target_ordered_row, timing_stamp, weighted_target_order, write_campaign_metadata, write_campaign_summary
 from bindcraft.campaign_log import binder_optimization, campaign_budget_exhausted, campaign_closed, campaign_header, campaign_label, design_worker_index, speaks_for_the_campaign, trajectory_already_designed, trajectory_design_label, trajectory_header
 from bindcraft.design_identity import design_hash, design_name
@@ -269,7 +270,9 @@ def run_campaign(settings: dict, project_folder: str, af2_weights: str | None=No
         print_campaign_header(settings, project_folder, design_settings)
     design_plan = campaign_design_plan(settings)
     multi_chain_binders, target_pad_length = design_plan.multi_chain_binders, design_plan.target_pad_length
+
     alphafold_model = campaign_design_model(design_plan, selected_models.design_models, af2_weights, settings)
+
     refuse_predictor_without_distogram(settings, alphafold_model)
     mpnn_model = ProteinMPNNSequenceModel(data_dir=mpnn_weights, max_cache_size=16, model_name=settings.get('mpnn_model', 'v_48_020'), variant=settings.get('mpnn_variant', 'negative'), omitted_amino_acids=design_settings.binder.omitted_amino_acids, amino_acid_bias=design_settings.binder.amino_acid_bias, multi_chain_binders=multi_chain_binders, length_bucket_size=length_bucket_size, target_pad_length=target_pad_length) if mpnn_weights and (not settings.get('trajectory_only')) else None
     build_validation_model = lambda validation_models: AlphaFoldDesignModel(presets=validation_models, data_dir=af2_weights, max_cache_size=16, num_recycle=settings.get('validation_recycles', 3), cyclic_offset_mode=resolve_cyclic_offset_mode(settings), subbatch_size=subbatch_size, attention_backend=attention_backend, use_cueq=use_cueq, use_remat=use_remat, length_bucket_size=length_bucket_size, dropout=False, multi_chain_binders=multi_chain_binders, target_pad_length=target_pad_length)
@@ -334,11 +337,17 @@ def campaign_design_plan(settings: dict) -> CampaignDesignPlan:
                               target_pad_length=padded_prediction_length(max(target_lengths), length_bucket_size) if len(target_lengths) > 1 else 0)
 
 def campaign_design_model(design_plan: CampaignDesignPlan, design_models, af2_weights: str | None, settings: dict) -> AlphaFoldDesignModel:
-    return AlphaFoldDesignModel(presets=design_models, data_dir=af2_weights, max_cache_size=16,
-                                num_recycle=settings.get('design_recycles', DEFAULT_SETTINGS['design_recycles']),
-                                models=design_models, cyclic_offset_mode=resolve_cyclic_offset_mode(settings),
-                                subbatch_size=design_plan.subbatch_size, attention_backend=design_plan.attention_backend,
-                                use_cueq=design_plan.use_cueq, use_remat=design_plan.use_remat, length_bucket_size=design_plan.length_bucket_size,
-                                multi_chain_binders=design_plan.multi_chain_binders,
-                                target_pad_length=design_plan.target_pad_length,
-                                amino_acid_bias=design_plan.design_settings.binder.amino_acid_bias)
+    if settings['design_model']=='af2_multimer':
+        return AlphaFoldDesignModel(presets=design_models, data_dir=af2_weights, max_cache_size=16,
+                                    num_recycle=settings.get('design_recycles', DEFAULT_SETTINGS['design_recycles']),
+                                    models=design_models, cyclic_offset_mode=resolve_cyclic_offset_mode(settings),
+                                    subbatch_size=design_plan.subbatch_size, attention_backend=design_plan.attention_backend,
+                                    use_cueq=design_plan.use_cueq, use_remat=design_plan.use_remat, length_bucket_size=design_plan.length_bucket_size,
+                                    multi_chain_binders=design_plan.multi_chain_binders,
+                                    target_pad_length=design_plan.target_pad_length,
+                                    amino_acid_bias=design_plan.design_settings.binder.amino_acid_bias)
+    elif settings['design_model'] == 'of2_multimer':
+        return OpenFoldDesignModel(models=design_models, data_dir=af2_weights, 
+                                   num_recycle=settings.get('design_recycles'),
+                                   amino_acid_bias=design_plan.design_settings.binder.amino_acid_bias
+                                   )
