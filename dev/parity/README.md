@@ -32,7 +32,24 @@ working tree no matter what `sys.path` says. `launch.py` asserts which tree it g
 | `launch_avals.py` | Wraps the jitted gradient function and logs each call's argument avals (incl. JAX device commitment, shown as `c0`/`c1`). This is what found the recompile bug. |
 | `timegrad.py` | Steady-state timing of `sequence_gradients`, warm cache, to separate execution cost from compile cost. |
 | `bench_eager.py` | Eager microbenchmark of the shim/namespace indirection alone. |
+| `torch_device.py` | Calls the three loss helpers that build their own arrays with torch CUDA tensors and checks what comes back is on the card. Exit code 1 if anything is on the host. The only script here that can catch a missing `device=`. |
+| `paired_campaigns.sh` | Runs one campaign of N trajectories out of each tree, with every stage gate at 0.0 so the whole step schedule always runs. `short` is a 10-round schedule, `long` a 103-round one. |
+| `paired_stats.py` | Per metric: each tree's spread across trajectories, the paired difference, `\|Δ\|/sd`, and warm per-trajectory design seconds. |
 | `tiny_smoke.json` | 9-gradient-step, single-trajectory, trajectory-only campaign on hPDL1. ~10 s on a 4090. Set `project_folder` before use. |
+
+## Paired trajectories are cheap; paired campaigns are not
+
+`jax.random.fold_in(campaign_key, trajectory_number)` is what each trajectory draws from,
+so trajectory *n* of a campaign in one tree and trajectory *n* in the other are the same
+draw. One campaign of 24 trajectories therefore buys 24 paired samples for one compile —
+about 8 s a trajectory on a 10-round schedule against hPDL1, against ~60 s if each were
+its own `campaign_seed` in its own process. `paired_campaigns.sh` does this; use it rather
+than looping over seeds.
+
+Set the stage gates (`min_plddt_screen` and friends) to 0.0 for a comparison. Otherwise a
+trajectory is cut off wherever its pLDDT happens to fall, the two trees' trajectories run
+for different numbers of rounds, and the metric being compared is partly "where did this
+one stop".
 
 ## Two things that will waste an hour if forgotten
 

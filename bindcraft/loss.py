@@ -149,7 +149,8 @@ def binder_protomer_groups(protein_complex: dict[str, Protein], binder: str, per
 def chain_group_rows(protein_complex: dict[str, Protein], chain_names: tuple[str, ...]) -> A:
     xp = array_api_from_protein_complex(protein_complex)
     chain_slices = chain_residue_slices(protein_complex)
-    return xp.concat([xp.arange(chain_slices[name].start, chain_slices[name].stop) for name in chain_names])
+    device = array_device_from_protein_complex(protein_complex)
+    return xp.concat([xp.arange(chain_slices[name].start, chain_slices[name].stop, device=device) for name in chain_names])
 
 def chain_group_residue_weights(protein_complex: dict[str, Protein], chain_names: tuple[str, ...]) -> A:
     xp = array_api_from_protein_complex(protein_complex)
@@ -161,7 +162,7 @@ def complex_residue_weights(protein_complex: dict[str, Protein]) -> A:
 
 def binder_domain_membership(protein: Protein, domain_ids: tuple[int, ...], domain_count: int) -> A:
     xp = array_api_compat.array_namespace(protein.sequence)
-    domains = xpx.pad(xp.asarray(domain_ids, dtype=xp.int32), (0, max(len(protein) - len(domain_ids), 0)))[:len(protein)]
+    domains = xpx.pad(xp.asarray(domain_ids, dtype=xp.int32, device=array_api_compat.device(protein.sequence)), (0, max(len(protein) - len(domain_ids), 0)))[:len(protein)]
     return xpx.one_hot(domains, domain_count) * real_residue_weights(protein.flags)[:, None]
 
 def helical_pair_mask(protein: Protein) -> A:
@@ -901,24 +902,25 @@ def fold_switching_loss(protein_states: ProteinStates[A], predictions: Structure
 
 def elastic_network_covariance(coordinates: A, residue_mask: A, contact_decay: float, damping: float, eps: float=1e-08) -> A:
     xp = array_api_compat.array_namespace(coordinates)
+    device = array_api_compat.device(coordinates)
     residue_count = coordinates.shape[0]
     offsets = coordinates[None, :, :] - coordinates[:, None, :]
     squared_distances = xp.sum(xp.square(offsets), axis=-1)
     bond_directions = offsets / xp.sqrt(squared_distances + eps)[..., None]
-    spring_constants = xp.where(xp.eye(residue_count, dtype=xp.bool), 0.0, xp.exp(-squared_distances / contact_decay ** 2) * residue_mask[:, None] * residue_mask[None, :])
+    spring_constants = xp.where(xp.eye(residue_count, dtype=xp.bool, device=device), 0.0, xp.exp(-squared_distances / contact_decay ** 2) * residue_mask[:, None] * residue_mask[None, :])
     coupling_blocks = -spring_constants[..., None, None] * bond_directions[..., :, None] * bond_directions[..., None, :]
-    anchored_blocks = xp.einsum('ijab->iab', -coupling_blocks) + (1 - residue_mask)[:, None, None] * PADDING_ANCHOR_STIFFNESS * xp.eye(3)
-    hessian = xp.permute_dims(xpx.at(coupling_blocks)[xp.arange(residue_count), xp.arange(residue_count)].set(anchored_blocks), (0, 2, 1, 3)).reshape(3 * residue_count, 3*residue_count)
+    anchored_blocks = xp.einsum('ijab->iab', -coupling_blocks) + (1 - residue_mask)[:, None, None] * PADDING_ANCHOR_STIFFNESS * xp.eye(3, device=device)
+    hessian = xp.permute_dims(xpx.at(coupling_blocks)[xp.arange(residue_count, device=device), xp.arange(residue_count, device=device)].set(anchored_blocks), (0, 2, 1, 3)).reshape(3 * residue_count, 3*residue_count)
 
 
     centred_coordinates = (coordinates - masked_coordinate_centroid(coordinates, residue_mask)) * residue_mask[:, None]
     still = xp.zeros_like(residue_mask)
     rigid_body_motions = ((residue_mask, still, still), (still, residue_mask, still), (still, still, residue_mask), (still, -centred_coordinates[:, 2], centred_coordinates[:, 1]), (centred_coordinates[:, 2], still, -centred_coordinates[:, 0]), (-centred_coordinates[:, 1], centred_coordinates[:, 0], still))
     rigid_body_basis, _ = xp.linalg.qr(xp.stack([xp.reshape(xp.stack(motion, axis=-1), (-1,)) for motion in rigid_body_motions], axis=-1))
-    internal_projector = xp.eye(3 * residue_count) - rigid_body_basis @ rigid_body_basis.T
+    internal_projector = xp.eye(3 * residue_count, device=device) - rigid_body_basis @ rigid_body_basis.T
     internal_hessian = internal_projector @ hessian @ internal_projector
     mean_curvature = xp.clip((xp.diagonal(internal_hessian) * xp.repeat(residue_mask, 3)).sum() / xp.clip(3 * xp.sum(residue_mask) - 6, 1.0, None), eps, None)
-    return internal_projector @ xp.linalg.inv(internal_hessian + damping * mean_curvature * xp.eye(3 * residue_count)) @ internal_projector
+    return internal_projector @ xp.linalg.inv(internal_hessian + damping * mean_curvature * xp.eye(3 * residue_count, device=device)) @ internal_projector
 
 @loss('collective_softness')
 def collective_softness_loss(protein_states: ProteinStates[A], predictions: StructurePredictions[A], prediction_state: str='binder_alone', chain: str='binder', contact_decay: float=8.0, damping: float=0.01, power_iterations: int=12, eps: float=1e-08) -> A:
