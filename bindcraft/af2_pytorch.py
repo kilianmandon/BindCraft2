@@ -29,6 +29,7 @@ from openfold.model.model import AlphaFold
 from openfold.config import model_config
 from openfold.utils.import_weights import import_jax_weights_
 from openfold.model.dropout import Dropout as OpenFoldDropout
+from openfold.utils.loss import compute_tm
 
 
 def alphafold_npz_path(data_dir: str, model_name: str) -> str:
@@ -372,7 +373,16 @@ class OpenFoldDesignModel(DifferentiableProteinPredictor):
                     residue_index=protein.residue_index,
                 )
 
-            metrics = self.openfold_prediction_metrics(out)
+            interface_asym_ids = features["asym_id"][..., 0].clone()
+            res_offset = 0
+            all_binders = all(k=='binder' or k.startswith('binder_') for k in protein_complex)
+            for chain in sorted(protein_complex):
+                n_res = protein_complex[chain].sequence.shape[0]
+                if not all_binders and (chain=='binder' or chain.startswith('binder_')):
+                    interface_asym_ids[res_offset:res_offset+n_res] = 1000
+                res_offset += n_res
+
+            metrics = self.openfold_prediction_metrics(out, features["seq_mask"][..., 0], interface_asym_ids)
 
             structure_predictions[state_name] = StructurePrediction(
                 out_protein_complex, metrics
@@ -389,7 +399,8 @@ class OpenFoldDesignModel(DifferentiableProteinPredictor):
             )
 
 
-        structure_predictions = nested_map(structure_predictions, lambda x: jnp.asarray(x.detach().cpu().numpy()))
+        torch_to_jax = lambda x: jnp.asarray((x.float() if x.dtype==torch.bfloat16 else x).detach().cpu().numpy())
+        structure_predictions = nested_map(structure_predictions, torch_to_jax)
 
         return structure_predictions
     
@@ -458,23 +469,24 @@ class OpenFoldDesignModel(DifferentiableProteinPredictor):
             for chain, seq in chain_seqs.items()
         }
 
-        torch_to_jax = lambda x: jnp.asarray(x.detach().cpu().numpy())
+        torch_to_jax = lambda x: jnp.asarray((x.float() if x.dtype==torch.bfloat16 else x).detach().cpu().numpy())
         structure_predictions = nested_map(structure_predictions, torch_to_jax)
         sequence_gradients = nested_map(sequence_gradients, torch_to_jax)
         total_loss = nested_map(total_loss, torch_to_jax)
 
         return structure_predictions, sequence_gradients, total_loss
 
-    def openfold_prediction_metrics(self, openfold_outputs: dict) -> dict[str, A]:
+    def openfold_prediction_metrics(self, openfold_outputs: dict, seq_mask: A, interface_asym_id: A) -> dict[str, A]:
         metrics: dict[str, torch.Tensor] = {}
         if "plddt" in openfold_outputs:
             metrics["plddt"] = openfold_outputs["plddt"] / 100
         if "predicted_aligned_error" in openfold_outputs:
             pae = openfold_outputs["predicted_aligned_error"]
             metrics["pae"] = (pae + pae.T) / 2
-            metrics["ptm"] = openfold_outputs["ptm_score"]
-            metrics["iptm"] = openfold_outputs["iptm_score"]
-            metrics["iptm_per_residue"] = openfold_outputs["iptm_per_residue_score"]
+            
+            metrics["ptm"] = compute_tm(openfold_outputs["tm_logits"], residue_weights=seq_mask)
+            metrics["iptm"], metrics["iptm_per_residue"] = compute_tm(openfold_outputs["tm_logits"], residue_weights=seq_mask, asym_id=interface_asym_id,
+                                         interface=True, return_per_alignment=True)
         # if 'experimentally_resolved' in openfold_outputs:
         # metrics['experimentally_resolved_ca'] = jax.nn.sigmoid(openfold_outputs['experimentally_resolved']['logits'][:, ATOM_INDEX['CA']])
         if "distogram_logits" in openfold_outputs:
