@@ -18,7 +18,7 @@ if _ROOT:
                      and 'Editable' not in type(f).__name__]
     sys.path.insert(0, _ROOT)
 import torch
-from bindcraft.protein import Protein, ResidueFlags
+from bindcraft.protein import Protein, ResidueFlags, kabsch
 import bindcraft.loss as L
 
 DEVICE = os.environ.get('BC_TORCH_DEVICE', 'cuda')
@@ -43,6 +43,14 @@ CASES = {
  'chain_group_rows':          lambda: L.chain_group_rows(protein_complex, ('binder', 'target')),
  'binder_domain_membership':  lambda: L.binder_domain_membership(binder, (0, 0, 0, 1, 1, 1), 2),
  'elastic_network_covariance': lambda: L.elastic_network_covariance(coordinates, residue_weights, 8.0, 0.01),
+    # kabsch builds a 3x3 identity and a length-2 ones vector internally. Both sat on the host,
+    # so every kabsch call on a CUDA tensor raised a device mismatch -- the identity is the
+    # fallback branch of an xp.where, and xp.where evaluates both branches, so it was not
+    # limited to the zero-weight case. Nothing in the torch path called kabsch until the
+    # openfold backend gained align_prediction_to_target_template, which is why it went unseen
+    # by the very script written to catch a missing device=.
+    'kabsch_rotation': lambda: kabsch(coordinates, coordinates.flip(0), residue_weights)[0],
+    'kabsch_zero_weights': lambda: kabsch(coordinates, coordinates.flip(0), torch.zeros_like(residue_weights))[0],
 }
 failed = 0
 for name, case in CASES.items():

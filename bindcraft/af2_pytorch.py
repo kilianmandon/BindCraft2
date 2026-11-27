@@ -14,6 +14,7 @@ from bindcraft.prediction import DifferentiableProteinPredictor
 from bindcraft.protein import (
     A,
     AMINO_ACIDS,
+    ATOM_INDEX,
     ATOM_NAMES,
     Protein,
     ProteinStates,
@@ -21,6 +22,7 @@ from bindcraft.protein import (
     StructurePrediction,
     StructurePredictions,
     has_residue_flag,
+    kabsch,
     real_residue_mask,
 )
 from bindcraft.sequence_optimization import sequence_features_from_logits
@@ -98,6 +100,53 @@ def complex_residue_arrays(protein_complex: dict[str, Protein[A]]) -> dict[str, 
             ]
         ),
     }
+
+
+def align_prediction_to_target_template(
+    predicted_atom_positions: A,
+    predicted_atom_mask: A,
+    template_atom_positions: A,
+    template_atom_mask: A,
+    flags: A,
+) -> A:
+    """The torch counterpart of af2.py:88, which af2 applies on both of its paths (af2.py:435
+    in predict, af2.py:480 in the gradient path) and which this port was missing.
+
+    AlphaFold emits the complex in an arbitrary frame. af2 superposes it onto the target's own
+    template coordinates using the target residues (TEMPLATE and not DESIGN) as the alignment
+    set, so the prediction comes back in the frame the caller supplied the target in. Measured
+    without it, of2's centroid sat at [0.75, 1.73, 2.00] against af2's [21.53, -54.01, -32.77]
+    for the same input, while the superposed CA RMSD was 0.019A: a pure rigid offset.
+
+    Rigid motion leaves distances alone, so this does not move contact or radius-of-gyration
+    losses. It matters for everything that reads the coordinates in the target's frame: written
+    structures, the MPNN stage, validation, and any template-relative loss. The final `where`
+    also zeroes atoms that do not exist, which af2 relies on downstream.
+
+    kabsch comes from protein.py and is array-api generic, so it runs on torch unchanged. The
+    rotation is built from detached coordinates, matching af2's jax.lax.stop_gradient: the
+    gradient flows through the positions being moved, never through the frame they move into.
+    """
+    ca_atom_index = ATOM_INDEX["CA"]
+    template_residue_mask = has_residue_flag(
+        flags, ResidueFlags.TEMPLATE
+    ) & ~has_residue_flag(flags, ResidueFlags.DESIGN)
+    alignment_weights = (
+        template_residue_mask.bool() & template_atom_mask[:, ca_atom_index].bool()
+    ).float()
+    predicted_ca_coordinates = (
+        predicted_atom_positions[:, ca_atom_index].detach().float()
+    )
+    template_ca_coordinates = template_atom_positions[:, ca_atom_index].float()
+    alignment_rotation, prediction_center, template_center = kabsch(
+        predicted_ca_coordinates, template_ca_coordinates, alignment_weights
+    )
+    aligned_atom_positions = (
+        predicted_atom_positions.float() - prediction_center
+    ) @ alignment_rotation.T + template_center
+    return torch.where(
+        predicted_atom_mask[:, :, None].bool(), aligned_atom_positions, 0.0
+    ).to(predicted_atom_positions.dtype)
 
 
 def openfold_input_features(
@@ -280,6 +329,12 @@ class OpenFoldDesignModel(DifferentiableProteinPredictor):
             # checkpointing on torch.is_grad_enabled() alone (evoformer.py:1053), so the
             # eval-mode default of blocks_per_ckpt=None would retain every activation.
             config.globals.blocks_per_ckpt = 1
+            # openfold's multimer preset early-stops recycling once CA distances move less
+            # than 0.5A (config.py:947, model.py:204), while af2.py:197 always runs every
+            # cycle. Left on, of2 silently does fewer recycles than af2 on the same design.
+            # It is also the data-dependent branch that defeats whole-model torch.compile,
+            # and its .item() forces a host sync per cycle.
+            config.model.recycle_early_stop_tolerance = -1.0
             with skip_openfold_init():
                 self.runners[model_family] = AlphaFold(config)
 
@@ -356,12 +411,23 @@ class OpenFoldDesignModel(DifferentiableProteinPredictor):
             with self._forked_rng():
                 out = runner(features)
 
+            # af2.py:480 aligns the whole complex at once, before splitting it per chain, so the
+            # alignment set spans every target chain. Do the same here rather than per chain.
+            input_arrays = complex_residue_arrays(protein_complex)
+            aligned_atom_positions = align_prediction_to_target_template(
+                out["final_atom_positions"],
+                out["final_atom_mask"],
+                input_arrays["atoms"],
+                input_arrays["atom_mask"],
+                input_arrays["flags"],
+            )
+
             out_protein_complex = {}
             residue_offset = 0
             for chain in sorted(protein_complex):
                 protein = protein_complex[chain]
                 n_res = protein.atoms.shape[0]
-                atoms = out["final_atom_positions"][residue_offset:residue_offset+n_res]
+                atoms = aligned_atom_positions[residue_offset:residue_offset+n_res]
                 atom_mask = out["final_atom_mask"][residue_offset:residue_offset+n_res]
                 residue_offset += n_res
                 
@@ -399,7 +465,6 @@ class OpenFoldDesignModel(DifferentiableProteinPredictor):
             )
 
 
-        torch_to_jax = lambda x: jnp.asarray((x.float() if x.dtype==torch.bfloat16 else x).detach().cpu().numpy())
         structure_predictions = nested_map(structure_predictions, torch_to_jax)
 
         return structure_predictions
@@ -464,12 +529,27 @@ class OpenFoldDesignModel(DifferentiableProteinPredictor):
         )
         total_loss.backward()
 
+        # af2.py:502 records each weighted term on the state's metrics, which is what the
+        # trajectory log reads its per-loss columns from. Without this of2 campaigns logged a
+        # total and nothing else, and the two backends could not be compared term by term.
+        # The overwrite guard is af2.py:503's, kept so a loss named after a metric fails loudly
+        # on this backend too rather than silently replacing the model's own value.
+        for name, entry in losses.items():
+            for state_name in (
+                entry.required_states or structure_predictions.keys()
+            ) & structure_predictions.keys():
+                metrics = structure_predictions[state_name].metrics
+                if name in metrics:
+                    raise ValueError(
+                        f"loss {name!r} would overwrite an existing metric on {state_name!r}"
+                    )
+                metrics[name] = weighted_losses[name].detach()
+
         sequence_gradients = {
             chain: seq.grad if seq.grad is not None else torch.zeros_like(seq)
             for chain, seq in chain_seqs.items()
         }
 
-        torch_to_jax = lambda x: jnp.asarray((x.float() if x.dtype==torch.bfloat16 else x).detach().cpu().numpy())
         structure_predictions = nested_map(structure_predictions, torch_to_jax)
         sequence_gradients = nested_map(sequence_gradients, torch_to_jax)
         total_loss = nested_map(total_loss, torch_to_jax)
@@ -487,12 +567,28 @@ class OpenFoldDesignModel(DifferentiableProteinPredictor):
             metrics["ptm"] = compute_tm(openfold_outputs["tm_logits"], residue_weights=seq_mask)
             metrics["iptm"], metrics["iptm_per_residue"] = compute_tm(openfold_outputs["tm_logits"], residue_weights=seq_mask, asym_id=interface_asym_id,
                                          interface=True, return_per_alignment=True)
-        # if 'experimentally_resolved' in openfold_outputs:
-        # metrics['experimentally_resolved_ca'] = jax.nn.sigmoid(openfold_outputs['experimentally_resolved']['logits'][:, ATOM_INDEX['CA']])
+        # af2.py:221's metric. loss.py:228 (the 'experimentally_resolved' loss) indexes it, so
+        # leaving it out made that loss a KeyError on this backend. openfold's AuxiliaryHeads
+        # exposes the same logits under a flat name (heads.py:72).
+        if "experimentally_resolved_logits" in openfold_outputs:
+            metrics["experimentally_resolved_ca"] = torch.sigmoid(
+                openfold_outputs["experimentally_resolved_logits"][:, ATOM_INDEX["CA"]]
+            )
         if "distogram_logits" in openfold_outputs:
             metrics["distogram"] = openfold_outputs["distogram_logits"]
 
         return metrics
+
+
+def torch_to_jax(array: torch.Tensor):
+    """numpy has no bfloat16, so widen only that dtype.
+
+    Casting unconditionally would turn flags (uint8) and residue_index (int32) into
+    float32, and has_residue_flag's `flags & flag` (protein.py:61) rejects floats.
+    """
+    if array.dtype == torch.bfloat16:
+        array = array.float()
+    return jnp.asarray(array.detach().cpu().numpy())
 
 
 def nested_map(obj, f):

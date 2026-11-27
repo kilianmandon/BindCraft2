@@ -92,6 +92,22 @@ def arange_beside(reference: A, count: int, dtype=None) -> A:
         return xp.arange(count, dtype=dtype, device=array_api_compat.device(reference))
     return xp.arange(count, dtype=dtype)
 
+# Same reasoning as arange_beside, for xp.eye: kabsch builds a 3x3 identity as the fallback
+# branch of an xp.where, and xp.where evaluates both branches, so on torch an identity left on
+# the CPU makes every GPU kabsch call fail with a device mismatch. jax keeps the undeviced call
+# so an eager jnp.eye is never committed.
+def eye_beside(reference: A, size: int, dtype=None) -> A:
+    xp = array_api_compat.array_namespace(reference)
+    if _is_torch(reference):
+        return xp.eye(size, dtype=dtype, device=array_api_compat.device(reference))
+    return xp.eye(size, dtype=dtype)
+
+def ones_beside(reference: A, size: int, dtype=None) -> A:
+    xp = array_api_compat.array_namespace(reference)
+    if _is_torch(reference):
+        return xp.ones(size, dtype=dtype, device=array_api_compat.device(reference))
+    return xp.ones(size, dtype=dtype)
+
 def softmax(values: A, axis: int=-1) -> A:
     if _is_torch(values):
         import torch
@@ -161,10 +177,10 @@ def kabsch(coordinates: A, reference_coordinates: A, alignment_weights: A) -> tu
     alignment_weight_sum = alignment_weights.sum() + 1e-08
     coordinate_center = (coordinates * alignment_weights[:, None]).sum(0) / alignment_weight_sum
     reference_center = (reference_coordinates * alignment_weights[:, None]).sum(0) / alignment_weight_sum
-    alignment_covariance = xp.where(alignment_weights.sum() > 0, alignment_matrix_product(((coordinates - coordinate_center) * alignment_weights[:, None]).T, reference_coordinates - reference_center), xp.eye(3, dtype=coordinates.dtype))
+    alignment_covariance = xp.where(alignment_weights.sum() > 0, alignment_matrix_product(((coordinates - coordinate_center) * alignment_weights[:, None]).T, reference_coordinates - reference_center), eye_beside(coordinates, 3, dtype=coordinates.dtype))
     left_vectors, _, right_vectors = xp.linalg.svd(alignment_covariance)
     rotation_determinant = xp.sign(xp.linalg.det(alignment_matrix_product(right_vectors.T, left_vectors.T)))
-    reflection_correction = xp.concat([xp.ones(2, dtype=coordinates.dtype), xp.reshape(xp.astype(rotation_determinant, coordinates.dtype), (1,))])
+    reflection_correction = xp.concat([ones_beside(coordinates, 2, dtype=coordinates.dtype), xp.reshape(xp.astype(rotation_determinant, coordinates.dtype), (1,))])
     rotation = alignment_matrix_product(right_vectors.T * reflection_correction, left_vectors.T)
     return rotation, coordinate_center, reference_center
 

@@ -197,3 +197,147 @@ coexisting; it type-checks, but the class-scoped `A` shadows the module-level on
 
 Note that `A` is only a marker — it is never bound to a union of the two array types,
 because that union cannot be spelled without importing both frameworks.
+
+# OpenFold design model: parity findings on `of2-design-model`
+
+Context for the uncommitted diff on this branch (`af2_pytorch.py` +106/−2,
+`protein.py` +20/−2, `dev/parity/torch_device.py` +10/−1). Read the "what is not true"
+section before reusing any number from an earlier write-up of this work.
+
+## The confounder that invalidates campaign-level backend comparison
+
+`campaign_design_model` samples **a different AlphaFold model per gradient step** from
+`MULTIMER_POOL` (5 models), and each backend samples from its own RNG: `af2.py` uses
+`jax.random.split` + `jax.random.randint` (threefry), `af2_pytorch.py` uses
+`torch.randint` on a `torch.Generator` (Philox). These are different algorithms, so the
+sequences cannot coincide.
+
+Measured by wrapping `_resolve_model_name` / `_sample_design_model` and logging every
+choice over one campaign per backend from the same seed:
+
+| | |
+|---|---|
+| step-by-step agreement | **9/33 = 27%** (chance = 20%) |
+| of2 model mix | `{1: 12, 2: 3, 3: 7, 4: 8, 5: 3}` |
+| af2 model mix | `{1: 11, 2: 10, 3: 3, 4: 7, 5: 5}` |
+
+So ~73% of "paired" steps compared **different model weights**, and the mix itself is
+skewed (model_2: 3 vs 10; model_3: 7 vs 3) — which is a mechanism for a systematic
+metric offset with a consistent sign, and is the most likely explanation for the
+consistent-sign offsets seen across all four shapes (ptm +, iptm +, plddt −, pae −).
+
+It also resolves the discrepancy that forced this investigation: the forward test agreed
+to 1e-3 relative while campaign step 1 disagreed 2–11%. The forward test forced one model
+on both sides; campaign step 1 compared model_4 against model_1.
+
+**Consequence for anyone comparing backends:** paired comparison is impossible unless
+`model=` is forced. Byte-identical inputs are necessary but not sufficient — verify the
+weights match too, which is one line of instrumentation.
+
+**Consequence for users:** `campaign_seed` does not reproduce a trajectory across
+backends even though its name implies it does. A fix would derive of2's model index from
+the same JAX key `af2.py` uses, keeping the torch `Generator` only for dropout masks,
+which genuinely cannot be matched.
+
+## What this branch fixes (all verified)
+
+1. **`align_prediction_to_target_template`** in `af2_pytorch.py`, porting `af2.py:88`,
+   called on the whole complex before the per-chain split as `af2.py:480` does. The
+   `.bool()` casts in it are load-bearing: `complex_residue_arrays` returns `atom_mask`
+   as float, and openfold's `final_atom_mask` is float. Verified against af2: of2 binder
+   centroid moved to `[21.44, −54.00, −32.89]` against af2's `[21.53, −54.01, −32.77]`,
+   max coordinate deviation 99.985 → 1.853 Å, Rg and RMSD bit-identical.
+2. **`experimentally_resolved_ca`** on metrics (`loss.py:228` reads it; it was commented
+   out).
+3. **Weighted loss terms written back to metrics** after `total_loss.backward()`,
+   mirroring `af2.py:502-505` including the overwrite guard.
+4. **`kabsch` CUDA device bug in shared code** (`protein.py`) — a pre-existing bug on
+   `main`, not a port artefact. `xp.eye(3, ...)` at `:164` and `xp.ones(2, ...)` at `:177`
+   were built on the host. Since `xp.where` evaluates both branches, **every `kabsch`
+   call on a CUDA tensor raised a device mismatch**, not only the zero-weight case. Fixed
+   with `eye_beside` / `ones_beside` next to the existing `arange_beside` (which exists
+   because passing `device=` to an eager JAX call commits the array and can trigger
+   recompilation — see the comment at `protein.py:86-88`). This is logically independent
+   of this branch and could land on `main` on its own.
+5. **`dev/parity/torch_device.py`** gained `kabsch_rotation` and `kabsch_zero_weights`.
+   The script written specifically to catch a missing `device=` had missed this entire
+   bug class, because nothing in the torch path called `kabsch` until of2 gained the
+   template alignment. Now 6 checks, all on the device.
+
+Verified by: `torch_device.py` all-on-device; `parity.py` 62/62, zero errors; campaign
+smoke test exit 0 with all 8 loss terms plus `experimentally_resolved_ca` present on
+metrics; step-1 loss moved 9.5e-07.
+
+## Backend agreement that does hold
+
+Only measurements that forced a single model, or that involve no model pool, survive:
+
+| check | result |
+|---|---|
+| forward pass, one-hot sequence, 3 seeds | pTM 7.2e-4, ipTM 8.7e-4, pLDDT 1.4e-3 relative |
+| — for scale | smaller than af2's own fp32-vs-bf16 gap |
+| predicted structure | 0.59 Å CA RMSD |
+| distogram-loss gradient w.r.t. sequence logits | cosine 0.99846, magnitude ratio 1.0123 |
+| JAX-side differential parity after the `protein.py` fix | 62/62 |
+
+On the two standing questions this answers: the weights are the identical
+`params_model_1_multimer_v3.npz` on both sides, so "fit for JAX" is not a property the
+weights can have, and the 1e-4 forward agreement is direct evidence openfold's import is
+faithful. PyTorch and JAX reverse-mode AD are equivalent by construction; measured at
+0.998 cosine, with of2 at least as reproducible as af2.
+
+## What is **not** true — retracted claims
+
+Do not reuse these; they are in the session history and they are wrong.
+
+- **The blocked significance test** (ptm +0.0102 p=0.014, ipTM +0.0213 p=0.020, pae_mean
+  −0.59 p=0.012) over 12 trajectory pairs. Withdrawn: unsynchronised model draws, so it
+  measures model-pool variance, not backend parity.
+- **The compactness / radius-of-gyration trajectory analysis**, and "the entire loss gap
+  is compactness". True at step 1 only, the most degenerate point; mean ΔRg across the
+  trajectory is +0.86 ± 0.84 (t = 1.03, n.s.) with oscillating sign.
+- **"The heads agree while the coordinates diverge"**: this mixed measurement
+  conditions — the 1e-3 figure is from the forced-single-model forward test, the 5.4 Å
+  figure from campaign step 1, where the metrics in fact disagree 2.7–11.4%.
+- **"A 17× gradient defect in of2"**: artefact of an ill-conditioned pLDDT probe measured
+  with XLA autotuning on. With a distogram loss and `--xla_gpu_autotune_level=0`:
+  cosine 0.99846, ratio 1.0123.
+- **"af2's bf16 pLDDT gradient is 2238× its fp32 one"**: did not reproduce at another
+  seed (ratio 1.3, cosine −0.322), and the per-element spread (p10 452, p90 2903, with
+  83.4% of the norm in 10 of 1100 elements) rules out the uniform 2^11 scale factor I
+  speculated. The honest statement is that af2's bf16 pLDDT gradient bears **no reliable
+  relation** to its fp32 one, which is why the prior session's bf16 recommendation is
+  withdrawn on numerical grounds. The speed case stands on its own (1.199 s vs 1.774 s).
+- **"Initial sequences were unmatched"**: refuted, md5 `89b49b0e403c` on both. The
+  inference from differing step-0 losses was unsound — loss depends on the prediction and
+  on `bucket_length`, not on the sequence alone.
+- **"l64 is unpadded"**: wrong, 64 + 115 = 179 → 192, pad 13. Every shape tested had af2
+  padding of 5–22 residues.
+
+Two methodological traps worth remembering:
+
+- **Finite differences cannot validate these gradients.** `aatype = sequence.argmax(-1)`
+  feeds the atom14/atom37 masks, `template_aatype` and `msa`, so the loss is piecewise
+  constant in the sequence; FD ratios swung 300× between eps 1e-2 and 1e-3.
+- **`plddt_loss` (`loss.py:206-212`) is a masked mean over designed binder residues
+  only.** A pLDDT measured over the whole complex is a different quantity and must not be
+  compared against it.
+
+Also: af2 is **not** padding-invariant — 1.27 Å CA RMSD between `bucket=1` and
+`bucket=32` on the same input — but the effect on the metrics is small (3e-4 on pTM,
+−0.04 Å on Rg), so padding is not an explanation for anything here.
+
+Stage schedule, measured rather than derived: `softmax_weight` at the first six steps is
+**0.225, 0.45, 0.675, 0.90, 0.95, 1.0** — the first value is 0.225, not the 0.25 that
+reading `_linear_sequence_schedule(0, 1, 0, 4)` suggests.
+
+## Remaining gaps in `af2_pytorch.py`, not fixed
+
+- **Model sampling cannot be synchronised with af2** (above). Highest value of the four.
+- `sym_id = ones_like(asym_id)` and `entity_id = asym_id.clone()` diverge from
+  `residue_entity_ids(..., multi_chain_binders)` when `copies > 1` and
+  `oligomer_tie='symmetric'`.
+- **No cyclic-offset support**, and `__init__` accepts no `cyclic_offset_mode`,
+  `multi_chain_binders`, `target_flexibility` or `target_pad_length`.
+- `settings.get('design_recycles')` is read without the `DEFAULT_SETTINGS` fallback
+  `af2.py` uses. The two coincide at 1 today; it breaks silently if the default changes.
