@@ -240,8 +240,8 @@ class OpenFoldDesignModel(DifferentiableProteinPredictor):
         #RNG and takes no generator (dropout.py has no generator argument), so the key seeds
         #a Generator we own and advance ourselves, one draw per forward. Kept on the host so
         #it is device-independent: it only ever produces python ints.
-        seed = 0 if key is None else int(jax.random.randint(key, (), 0, 2 ** 31 - 1))
-        self.generator = torch.Generator().manual_seed(seed)
+        self.generator = torch.Generator()
+        self.key = key
         # the same per-amino-acid bias vector af2.py:314 builds, as a torch tensor
         self.amino_acid_bias = None if not amino_acid_bias else torch.as_tensor(
             [amino_acid_bias.get(amino_acid, 0.0) for amino_acid in AMINO_ACIDS],
@@ -283,6 +283,18 @@ class OpenFoldDesignModel(DifferentiableProteinPredictor):
                 self.runners[model_family] = AlphaFold(config)
 
         return self.runners[model_family]
+
+    @property
+    def key(self):
+        return self._key
+
+    @key.setter
+    def key(self, key) -> None:
+        """campaign.py:172 assigns a fresh jax key per trajectory, the same way it does to
+        AlphaFoldDesignModel. Reseed our Generator from it, or the per-trajectory key is
+        silently ignored and every trajectory reuses the same dropout stream."""
+        self._key = key
+        self.generator.manual_seed(0 if key is None else int(jax.random.randint(key, (), 0, 2 ** 31 - 1)))
 
     def _sample_design_model(self) -> str:
         return self.models[int(torch.randint(0, len(self.models), (), generator=self.generator))]
