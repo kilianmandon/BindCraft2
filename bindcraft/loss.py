@@ -510,7 +510,7 @@ def distogram_pair_loss(distogram: A, selected_bins: A, binary: bool) -> A:
     distogram = xp.astype(distogram, xp.float32)
     if binary:
         return -xp.log(xp.sum(selected_bins * softmax(distogram), axis=-1) + 1e-08)
-    selected_probabilities = softmax(distogram - 10000000.0 * (1 - selected_bins))
+    selected_probabilities = softmax(distogram - 10000000.0 * (1 - xp.astype(selected_bins, xp.float32)))
     return -xp.sum(selected_probabilities * log_softmax(distogram), axis=-1)
 
 def mean_selected_contact_loss(pair_loss: A, contacts_per_residue: int | float, contact_residue_count: int | float, residue_mask: A, contact_pair_mask: A) -> A:
