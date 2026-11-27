@@ -1,38 +1,71 @@
-import copy
 import os
 
+import jax
+import numpy as np
 import torch
+import jax.numpy as jnp
+
+import contextlib
+import openfold.model.primitives as primitives
 
 from bindcraft.af2 import alphafold_model_family
 from bindcraft.loss import DesignLoss
 from bindcraft.prediction import DifferentiableProteinPredictor
-from bindcraft.protein import (A, AMINO_ACIDS, ATOM_NAMES, Protein, ProteinStates, ResidueFlags,
-                               StructurePredictions, has_residue_flag, real_residue_mask)
+from bindcraft.protein import (
+    A,
+    AMINO_ACIDS,
+    ATOM_NAMES,
+    Protein,
+    ProteinStates,
+    ResidueFlags,
+    StructurePrediction,
+    StructurePredictions,
+    has_residue_flag,
+    real_residue_mask,
+)
 from bindcraft.sequence_optimization import sequence_features_from_logits
 from openfold.data import data_transforms
 from openfold.model.model import AlphaFold
 from openfold.config import model_config
 from openfold.utils.import_weights import import_jax_weights_
+from openfold.model.dropout import Dropout as OpenFoldDropout
+
 
 def alphafold_npz_path(data_dir: str, model_name: str) -> str:
-    for candidate in (f'params_{model_name}.npz', os.path.join('params', f'params_{model_name}.npz')):
+    for candidate in (
+        f"params_{model_name}.npz",
+        os.path.join("params", f"params_{model_name}.npz"),
+    ):
         path = os.path.join(data_dir, candidate)
         if os.path.isfile(path):
             return path
-    raise ValueError(f'no AlphaFold parameters for {model_name!r} in {data_dir!r}; '
-                     'run "bindcraft fetch-weights" to download them')
+    raise ValueError(
+        f"no AlphaFold parameters for {model_name!r} in {data_dir!r}; "
+        'run "bindcraft fetch-weights" to download them'
+    )
 
-import contextlib
-import openfold.model.primitives as primitives
 
-OPENFOLD_INITS = ('trunc_normal_init_', 'lecun_normal_init_', 'he_normal_init_',
-                  'glorot_uniform_init_', 'final_init_', 'gating_init_', 'normal_init_',
-                  'ipa_point_weights_init_')
+
+OPENFOLD_INITS = (
+    "trunc_normal_init_",
+    "lecun_normal_init_",
+    "he_normal_init_",
+    "glorot_uniform_init_",
+    "final_init_",
+    "gating_init_",
+    "normal_init_",
+    "ipa_point_weights_init_",
+)
+
 
 @contextlib.contextmanager
 def skip_openfold_init():
     """Build the module without initialising it: import_jax_weights_ writes every tensor."""
-    saved = {name: getattr(primitives, name) for name in OPENFOLD_INITS if hasattr(primitives, name)}
+    saved = {
+        name: getattr(primitives, name)
+        for name in OPENFOLD_INITS
+        if hasattr(primitives, name)
+    }
     for name in saved:
         setattr(primitives, name, lambda *args, **kwargs: None)
     try:
@@ -41,25 +74,40 @@ def skip_openfold_init():
         for name, function in saved.items():
             setattr(primitives, name, function)
 
-#one row of the alignment, one template, and openfold's 49 msa_feat channels: msa_1hot(23),
-#has_deletion(1), deletion_value(1), cluster_profile(23), deletion_mean(1), which is the layout
-#data_transforms_multimer.create_msa_feat builds and the one af2.py:191 writes into.
+
+# one row of the alignment, one template, and openfold's 49 msa_feat channels: msa_1hot(23),
+# has_deletion(1), deletion_value(1), cluster_profile(23), deletion_mean(1), which is the layout
+# data_transforms_multimer.create_msa_feat builds and the one af2.py:191 writes into.
 MSA_DEPTH, TEMPLATE_COUNT, MSA_FEATURE_CHANNELS = 1, 1, 49
+
 
 def complex_residue_arrays(protein_complex: dict[str, Protein[A]]) -> dict[str, A]:
     chains = [protein_complex[name] for name in sorted(protein_complex)]
     device = chains[0].sequence.device
-    return {'sequence': torch.cat([chain.sequence.float() for chain in chains]),
-            'atoms': torch.cat([chain.atoms.float() for chain in chains]),
-            'atom_mask': torch.cat([chain.atom_mask.float() for chain in chains]),
-            'flags': torch.cat([chain.flags for chain in chains]),
-            'residue_index': torch.cat([chain.residue_index.long() for chain in chains]),
-            'asym_id': torch.cat([torch.full((len(chain),), index + 1, dtype=torch.long, device=device)
-                                  for index, chain in enumerate(chains)])}
+    return {
+        "sequence": torch.cat([chain.sequence.float() for chain in chains]),
+        "atoms": torch.cat([chain.atoms.float() for chain in chains]),
+        "atom_mask": torch.cat([chain.atom_mask.float() for chain in chains]),
+        "flags": torch.cat([chain.flags for chain in chains]),
+        "residue_index": torch.cat([chain.residue_index.long() for chain in chains]),
+        "asym_id": torch.cat(
+            [
+                torch.full((len(chain),), index + 1, dtype=torch.long, device=device)
+                for index, chain in enumerate(chains)
+            ]
+        ),
+    }
 
-def openfold_input_features(protein_complex: dict[str, Protein[A]], num_recycle: int=1, softmax_weight: float=1.0,
-                            one_hot_weight: float=0.0, temperature: float=1.0, logit_scale: float=2.0,
-                            amino_acid_bias: A | None=None) -> dict[str, A]:
+
+def openfold_input_features(
+    protein_complex: dict[str, Protein[A]],
+    num_recycle: int = 1,
+    softmax_weight: float = 1.0,
+    one_hot_weight: float = 0.0,
+    temperature: float = 1.0,
+    logit_scale: float = 2.0,
+    amino_acid_bias: A | None = None,
+) -> dict[str, A]:
     """The dict openfold's multimer AlphaFold reads, from the arrays a design step already holds.
 
     The counterpart of af2.py's alphafold_input_features, and built the same way: no MSA search and no
@@ -74,68 +122,132 @@ def openfold_input_features(protein_complex: dict[str, Protein[A]], num_recycle:
     resample features between cycles the way openfold's training pipeline does.
     """
     arrays = complex_residue_arrays(protein_complex)
-    sequence, flags, asym_id = arrays['sequence'], arrays['flags'], arrays['asym_id']
+    sequence, flags, asym_id = arrays["sequence"], arrays["flags"], arrays["asym_id"]
     residues, device = sequence.shape[0], sequence.device
-    scalar = lambda value: torch.as_tensor(value, dtype=sequence.dtype, device=device)
+    scalar = lambda value: torch.as_tensor(np.asarray(value), dtype=sequence.dtype, device=device)
     designed = has_residue_flag(flags, ResidueFlags.DESIGN)[:, None]
     aatype = sequence.argmax(-1).long()
     residue_mask = real_residue_mask(flags).float()
 
-    #the same two feature sets af2.py:102 prepares, from the same function: below softmax_weight the
-    #linear path hands its logits over verbatim, so target_feat and the profile are not the same array
-    sequence_features = torch.where(designed, sequence_features_from_logits(
-        sequence, scalar(softmax_weight), scalar(one_hot_weight), scalar(temperature), scalar(logit_scale),
-        amino_acid_bias), sequence)
-    sequence_profile = torch.where(designed, sequence_features_from_logits(
-        sequence, scalar(softmax_weight), scalar(1.0), scalar(temperature), scalar(logit_scale),
-        amino_acid_bias), sequence)
-    msa_feat = torch.zeros((MSA_DEPTH, residues, MSA_FEATURE_CHANNELS), dtype=sequence.dtype, device=device)
-    msa_feat[0, :, 0:len(AMINO_ACIDS)] = sequence_features
-    msa_feat[0, :, 25:25 + len(AMINO_ACIDS)] = sequence_profile
-    #tf_dim is 21 for multimer and the designed sequence is 20 wide; af2's patched modules_multimer pads
-    #the 21st column itself, openfold does not
-    target_feat = torch.cat([sequence_features, torch.zeros((residues, 1), dtype=sequence.dtype, device=device)], dim=-1)
+    # the same two feature sets af2.py:102 prepares, from the same function: below softmax_weight the
+    # linear path hands its logits over verbatim, so target_feat and the profile are not the same array
+    sequence_features = torch.where(
+        designed,
+        sequence_features_from_logits(
+            sequence,
+            scalar(softmax_weight),
+            scalar(one_hot_weight),
+            scalar(temperature),
+            scalar(logit_scale),
+            amino_acid_bias,
+        ),
+        sequence,
+    )
+    sequence_profile = torch.where(
+        designed,
+        sequence_features_from_logits(
+            sequence,
+            scalar(softmax_weight),
+            scalar(1.0),
+            scalar(temperature),
+            scalar(logit_scale),
+            amino_acid_bias,
+        ),
+        sequence,
+    )
+    msa_feat = torch.zeros(
+        (MSA_DEPTH, residues, MSA_FEATURE_CHANNELS), dtype=sequence.dtype, device=device
+    )
+    msa_feat[0, :, 0 : len(AMINO_ACIDS)] = sequence_features
+    msa_feat[0, :, 25 : 25 + len(AMINO_ACIDS)] = sequence_profile
+    # tf_dim is 21 for multimer and the designed sequence is 20 wide; af2's patched modules_multimer pads
+    # the 21st column itself, openfold does not
+    target_feat = torch.cat(
+        [
+            sequence_features,
+            torch.zeros((residues, 1), dtype=sequence.dtype, device=device),
+        ],
+        dim=-1,
+    )
 
-    #atom14/atom37 bookkeeping is a lookup on the argmax, so it moves whenever the design does
-    atom_maps = data_transforms.make_atom14_masks({'aatype': aatype})
+    # atom14/atom37 bookkeeping is a lookup on the argmax, so it moves whenever the design does
+    atom_maps = data_transforms.make_atom14_masks({"aatype": aatype})
     template_residues = has_residue_flag(flags, ResidueFlags.TEMPLATE)
-    template_atom_mask = arrays['atom_mask'] * template_residues[:, None].float()
-    template_positions = torch.where(template_residues[:, None, None], arrays['atoms'], 0.0)
+    template_atom_mask = arrays["atom_mask"] * template_residues[:, None].float()
+    template_positions = torch.where(
+        template_residues[:, None, None], arrays["atoms"], 0.0
+    )
     expand = lambda array, *shape: array[None].expand(*shape)
 
-    features = {'aatype': aatype, 'residue_index': arrays['residue_index'], 'asym_id': asym_id,
-                'entity_id': asym_id.clone(), 'sym_id': torch.ones_like(asym_id),
-                'seq_mask': residue_mask, 'seq_length': torch.full((), residues, dtype=torch.long, device=device),
-                'target_feat': target_feat, 'msa_feat': msa_feat,
-                'msa': expand(aatype, MSA_DEPTH, residues).contiguous(),
-                'true_msa': expand(aatype, MSA_DEPTH, residues).contiguous(),
-                'msa_mask': expand(residue_mask, MSA_DEPTH, residues).contiguous(),
-                'msa_profile': torch.nn.functional.one_hot(aatype, 22).float(),
-                'cluster_profile': expand(torch.nn.functional.one_hot(aatype, 23).float(), MSA_DEPTH, residues, 23),
-                'num_alignments': torch.full((), MSA_DEPTH, dtype=torch.long, device=device),
-                #no alignment means no deletions, nothing clustered and nothing masked. the extra-MSA
-                #stack is given one empty row rather than none, so its shapes exist
-                'deletion_matrix': torch.zeros((MSA_DEPTH, residues), device=device),
-                'cluster_deletion_mean': torch.zeros((MSA_DEPTH, residues), device=device),
-                'bert_mask': torch.zeros((MSA_DEPTH, residues), device=device),
-                'extra_msa': torch.zeros((1, residues), dtype=torch.long, device=device),
-                'extra_msa_mask': torch.zeros((1, residues), device=device),
-                'extra_deletion_matrix': torch.zeros((1, residues), device=device),
-                'use_clamped_fape': torch.zeros((), device=device),
-                **{name: atom_maps[name] for name in ('atom14_atom_exists', 'atom37_atom_exists',
-                                                      'residx_atom14_to_atom37', 'residx_atom37_to_atom14')},
-                'template_aatype': expand(aatype, TEMPLATE_COUNT, residues).contiguous(),
-                'template_all_atom_mask': expand(template_atom_mask, TEMPLATE_COUNT, residues, len(ATOM_NAMES)),
-                'template_all_atom_positions': expand(template_positions, TEMPLATE_COUNT, residues, len(ATOM_NAMES), 3)}
-    return {name: value.unsqueeze(-1).expand(*value.shape, num_recycle + 1) for name, value in features.items()}
+    features = {
+        "aatype": aatype,
+        "residue_index": arrays["residue_index"],
+        "asym_id": asym_id,
+        "entity_id": asym_id.clone(),
+        "sym_id": torch.ones_like(asym_id),
+        "seq_mask": residue_mask,
+        "seq_length": torch.full((), residues, dtype=torch.long, device=device),
+        "target_feat": target_feat,
+        "msa_feat": msa_feat,
+        "msa": expand(aatype, MSA_DEPTH, residues).contiguous(),
+        "true_msa": expand(aatype, MSA_DEPTH, residues).contiguous(),
+        "msa_mask": expand(residue_mask, MSA_DEPTH, residues).contiguous(),
+        "msa_profile": torch.nn.functional.one_hot(aatype, 22).float(),
+        "cluster_profile": expand(
+            torch.nn.functional.one_hot(aatype, 23).float(), MSA_DEPTH, residues, 23
+        ),
+        "num_alignments": torch.full((), MSA_DEPTH, dtype=torch.long, device=device),
+        # no alignment means no deletions, nothing clustered and nothing masked. the extra-MSA
+        # stack is given one empty row rather than none, so its shapes exist
+        "deletion_matrix": torch.zeros((MSA_DEPTH, residues), device=device),
+        "cluster_deletion_mean": torch.zeros((MSA_DEPTH, residues), device=device),
+        "bert_mask": torch.zeros((MSA_DEPTH, residues), device=device),
+        "extra_msa": torch.zeros((1, residues), dtype=torch.long, device=device),
+        "extra_msa_mask": torch.zeros((1, residues), device=device),
+        "extra_deletion_matrix": torch.zeros((1, residues), device=device),
+        "use_clamped_fape": torch.zeros((), device=device),
+        **{
+            name: atom_maps[name]
+            for name in (
+                "atom14_atom_exists",
+                "atom37_atom_exists",
+                "residx_atom14_to_atom37",
+                "residx_atom37_to_atom14",
+            )
+        },
+        "template_aatype": expand(aatype, TEMPLATE_COUNT, residues).contiguous(),
+        "template_all_atom_mask": expand(
+            template_atom_mask, TEMPLATE_COUNT, residues, len(ATOM_NAMES)
+        ),
+        "template_all_atom_positions": expand(
+            template_positions, TEMPLATE_COUNT, residues, len(ATOM_NAMES), 3
+        ),
+    }
+    return {
+        name: value.unsqueeze(-1).expand(*value.shape, num_recycle + 1)
+        for name, value in features.items()
+    }
+
 
 class OpenFoldDesignModel(DifferentiableProteinPredictor):
-    def __init__(self, models, data_dir, num_recycle, amino_acid_bias):
+    def __init__(self, models, data_dir, num_recycle, amino_acid_bias, device="cuda",
+                 key=None, dropout=True):
+        self.device = device
         self.data_dir = data_dir
         self.num_recycle = 1 if num_recycle is None else int(num_recycle)
-        self.amino_acid_bias = amino_acid_bias
-        # TODO: Respect amino_acid_bias
+        self.dropout = dropout
+        #af2.py:307 holds a PRNGKey and splits it; openfold's Dropout reads torch's global
+        #RNG and takes no generator (dropout.py has no generator argument), so the key seeds
+        #a Generator we own and advance ourselves, one draw per forward. Kept on the host so
+        #it is device-independent: it only ever produces python ints.
+        seed = 0 if key is None else int(jax.random.randint(key, (), 0, 2 ** 31 - 1))
+        self.generator = torch.Generator().manual_seed(seed)
+        # the same per-amino-acid bias vector af2.py:314 builds, as a torch tensor
+        self.amino_acid_bias = None if not amino_acid_bias else torch.as_tensor(
+            [amino_acid_bias.get(amino_acid, 0.0) for amino_acid in AMINO_ACIDS],
+            dtype=torch.float32, device=self.device)
 
+        self.models = models
         self.model_families = dict()
         self.model_family_models = dict()
         self.runners = dict()
@@ -143,37 +255,246 @@ class OpenFoldDesignModel(DifferentiableProteinPredictor):
 
         self.attention_backend = None
         self.last_attention_backend = None
+        self.last_used_model = None
 
         for model_name in models:
             model_family = alphafold_model_family(model_name)
             self.model_families[model_name] = model_family
             self.model_family_models.setdefault(model_family, model_name)
-            model = self._openfold_runner(model_family)
-            import_jax_weights_(model, alphafold_npz_path(data_dir, model_name), version=model_name)
-            self.model_parameters[model_name] = {k: tensor.detach().clone() for k, tensor in model.state_dict().items()}
+            model = self._openfold_runner(model_family).to(device=self.device)
+            model.eval()
+            self._set_dropout(model, self.dropout)
+
+            import_jax_weights_(
+                model, alphafold_npz_path(data_dir, model_name), version=model_name
+            )
+            self.model_parameters[model_name] = {
+                k: tensor.detach().clone().to(device=self.device) for k, tensor in model.state_dict().items()
+            }
 
     def _openfold_runner(self, model_family):
         if model_family not in self.runners:
             config = model_config(self.model_family_models[model_family])
+            # sequence_gradients needs the backward graph, and openfold gates activation
+            # checkpointing on torch.is_grad_enabled() alone (evoformer.py:1053), so the
+            # eval-mode default of blocks_per_ckpt=None would retain every activation.
+            config.globals.blocks_per_ckpt = 1
             with skip_openfold_init():
                 self.runners[model_family] = AlphaFold(config)
 
         return self.runners[model_family]
 
+    def _sample_design_model(self) -> str:
+        return self.models[int(torch.randint(0, len(self.models), (), generator=self.generator))]
+
+    def _set_dropout(self, model, enabled: bool) -> None:
+        """Flip only the Dropout modules, not the whole module tree.
+
+        model.train() would also arm the `assert(not self.training)` guards on openfold's
+        offload paths (model.py:922,953,1193), and those are unrelated to dropout.
+        """
+        for module in model.modules():
+            if isinstance(module, (OpenFoldDropout, torch.nn.Dropout)):
+                module.train(enabled)
+
+    @contextlib.contextmanager
+    def _forked_rng(self):
+        """Draw the forward's dropout masks from our own stream, leaving the global RNG as it was."""
+        devices = [torch.device(self.device)] if torch.device(self.device).type == 'cuda' else []
+        step_seed = int(torch.randint(0, 2 ** 31 - 1, (), generator=self.generator))
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(step_seed)
+            yield
+
+    def _forward_with_metrics(
+        self,
+        protein_states: ProteinStates,
+        model: str | None = None,
+        softmax_weight: float = 1.0,
+        one_hot_weight: float = 0.0,
+        temperature: float = 1.0,
+        logit_scale: float = 2.0,
+    ):
+
+        protein_states, chain_seqs = self.prep_protein_states(protein_states)
+        structure_predictions = {}
+
+        if model is None:
+            model = self._sample_design_model()
+        model_family = self.model_families[model]
+
+        runner = self._openfold_runner(model_family)
+
+        if model != self.last_used_model:
+            runner.load_state_dict(self.model_parameters[model])
+            self.last_used_model = model
+
+        for state_name, protein_complex in protein_states.items():
+            features = openfold_input_features(
+                protein_complex,
+                self.num_recycle,
+                softmax_weight,
+                one_hot_weight,
+                temperature,
+                logit_scale,
+                self.amino_acid_bias,
+            )
+
+            with self._forked_rng():
+                out = runner(features)
+
+            out_protein_complex = {}
+            residue_offset = 0
+            for chain in sorted(protein_complex):
+                protein = protein_complex[chain]
+                n_res = protein.atoms.shape[0]
+                atoms = out["final_atom_positions"][residue_offset:residue_offset+n_res]
+                atom_mask = out["final_atom_mask"][residue_offset:residue_offset+n_res]
+                residue_offset += n_res
+                
+                out_protein_complex[chain] = Protein(
+                    sequence=chain_seqs[chain],
+                    atoms=atoms,
+                    atom_mask=atom_mask,
+                    flags=protein.flags,
+                    residue_index=protein.residue_index,
+                )
+
+            metrics = self.openfold_prediction_metrics(out)
+
+            structure_predictions[state_name] = StructurePrediction(
+                out_protein_complex, metrics
+            )
+
+        return structure_predictions, protein_states, chain_seqs
+
+    def predict(
+        self, protein_states: ProteinStates, model: str | None = None
+    ) -> StructurePredictions:
+        with torch.no_grad():
+            structure_predictions, _, _ = self._forward_with_metrics(
+                protein_states, model, one_hot_weight=1.0
+            )
 
 
-    def predict(self, protein_states: ProteinStates, model: str | None=None) -> StructurePredictions:
-        ...
+        structure_predictions = nested_map(structure_predictions, lambda x: jnp.asarray(x.detach().cpu().numpy()))
 
-    def sequence_gradients(self, protein_states: ProteinStates, losses: dict[str, DesignLoss], model: str | None=None, softmax_weight: float=1.0, one_hot_weight: float=0.0, temperature: float=1.0, logit_scale: float=2.0, reference_predictions: StructurePredictions | None=None, compile_only=False) -> tuple[StructurePredictions, dict[str, A], A]:
-        for experiment, protein in protein_states.items():
-            features = openfold_input_features(protein, self.num_recycle, softmax_weight, one_hot_weight, temperature, logit_scale, self.amino_acid_bias)
+        return structure_predictions
+    
 
-            model_family = self.model_families[model]
-            runner = self._openfold_runner(model_family)
+    def prep_protein_states(self, protein_states: ProteinStates):
+        chain_seqs = {}
+        out_protein_states = {}
 
-            out = runner(features)
+        jax_to_torch = lambda x: torch.as_tensor(np.array(x, copy=True), device=self.device)
+
+        for state_name, protein_state in protein_states.items():
+            out_protein_states[state_name] = {}
+            for chain, protein in protein_state.items():
+                if chain not in chain_seqs:
+                    chain_seqs[chain] = jax_to_torch(protein.sequence)
+                    chain_seqs[chain].requires_grad_(True)
+
+                out_protein_states[state_name][chain] = nested_map(protein, jax_to_torch)
+
+                out_protein_states[state_name][chain].sequence = chain_seqs[chain]
+
+        return out_protein_states, chain_seqs
+
+    def sequence_gradients(
+        self,
+        protein_states: ProteinStates,
+        losses: dict[str, DesignLoss],
+        model: str | None = None,
+        softmax_weight: float = 1.0,
+        one_hot_weight: float = 0.0,
+        temperature: float = 1.0,
+        logit_scale: float = 2.0,
+        reference_predictions: StructurePredictions | None = None,
+        compile_only=False,
+    ) -> tuple[StructurePredictions, dict[str, A], A]:
+
+        if compile_only:
+            # TODO: Think whether i actually want to compile
+            return {}, {}, jnp.array(0.0)
+
+        # TODO: Use reference_predictions (dont know how they should be used yet)
 
 
+        structure_predictions, protein_states, chain_seqs = (
+            self._forward_with_metrics(
+                protein_states,
+                model,
+                softmax_weight,
+                one_hot_weight,
+                temperature,
+                logit_scale,
+            )
+        )
+
+        weighted_losses = {
+            name: entry.weight * entry.function(protein_states, structure_predictions)
+            for name, entry in losses.items()
+        }
+        total_loss = sum(
+            weighted_losses.values(), torch.tensor(0.0, device=self.device)
+        )
+        total_loss.backward()
+
+        sequence_gradients = {
+            chain: seq.grad if seq.grad is not None else torch.zeros_like(seq)
+            for chain, seq in chain_seqs.items()
+        }
+
+        torch_to_jax = lambda x: jnp.asarray(x.detach().cpu().numpy())
+        structure_predictions = nested_map(structure_predictions, torch_to_jax)
+        sequence_gradients = nested_map(sequence_gradients, torch_to_jax)
+        total_loss = nested_map(total_loss, torch_to_jax)
+
+        return structure_predictions, sequence_gradients, total_loss
+
+    def openfold_prediction_metrics(self, openfold_outputs: dict) -> dict[str, A]:
+        metrics: dict[str, torch.Tensor] = {}
+        if "plddt" in openfold_outputs:
+            metrics["plddt"] = openfold_outputs["plddt"] / 100
+        if "predicted_aligned_error" in openfold_outputs:
+            pae = openfold_outputs["predicted_aligned_error"]
+            metrics["pae"] = (pae + pae.T) / 2
+            metrics["ptm"] = openfold_outputs["ptm_score"]
+            metrics["iptm"] = openfold_outputs["iptm_score"]
+            metrics["iptm_per_residue"] = openfold_outputs["iptm_per_residue_score"]
+        # if 'experimentally_resolved' in openfold_outputs:
+        # metrics['experimentally_resolved_ca'] = jax.nn.sigmoid(openfold_outputs['experimentally_resolved']['logits'][:, ATOM_INDEX['CA']])
+        if "distogram_logits" in openfold_outputs:
+            metrics["distogram"] = openfold_outputs["distogram_logits"]
+
+        return metrics
 
 
+def nested_map(obj, f):
+    if isinstance(obj, torch.Tensor) or isinstance(obj, jax.Array):
+        return f(obj)
+
+    if isinstance(obj, dict):
+        return {
+            k: nested_map(v, f) for k,v in obj.items()
+        }
+
+    if isinstance(obj, StructurePrediction):
+        return StructurePrediction(
+            protein_complex=nested_map(obj.protein_complex, f),
+            metrics=nested_map(obj.metrics, f),
+        )
+
+    if isinstance(obj, Protein):
+        return Protein(
+            sequence=nested_map(obj.sequence, f),
+            atoms=nested_map(obj.atoms, f),
+            atom_mask=nested_map(obj.atom_mask, f),
+            flags=nested_map(obj.flags, f),
+            residue_index=nested_map(obj.residue_index, f),
+        )
+
+    raise ValueError(f'Mapping for object {type(obj)} is not implemented.')
+
+    
